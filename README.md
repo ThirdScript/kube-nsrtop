@@ -68,34 +68,3 @@ directly from this repo's manifest:
 kubectl krew install --manifest-url \
   https://raw.githubusercontent.com/ThirdScript/kube-nsrtop/main/plugins/nsrtop.yaml
 ```
-
-### Manual
-
-Download `kubectl-nsrtop` from the
-[releases page](https://github.com/ThirdScript/kube-nsrtop/releases),
-make it executable, and place it on your `PATH`:
-
-```sh
-chmod +x kubectl-nsrtop
-sudo mv kubectl-nsrtop /usr/local/bin/
-```
-
-Then run it as `kubectl nsrtop`.
-
-## Releasing a new version
-
-1. Bump the version and tag it, e.g. `git tag v0.1.1 && git push origin v0.1.1`.
-2. Build the release tarball:
-   ```sh
-   tar -czf kubectl-nsrtop.tar.gz kubectl-nsrtop LICENSE
-   ```
-3. Create a GitHub release for the tag and upload `kubectl-nsrtop.tar.gz`.
-4. Compute the sha256 and update `plugins/nsrtop.yaml`:
-   ```sh
-   shasum -a 256 kubectl-nsrtop.tar.gz
-   ```
-5. Update `version` and `sha256` in `plugins/nsrtop.yaml`, commit, and push.
-
-## License
-
-MIT — see [LICENSE](LICENSE).
