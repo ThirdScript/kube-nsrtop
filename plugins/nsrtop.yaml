@@ -5,15 +5,15 @@ metadata:
 spec:
   version: "v0.1.0"
   platforms:
-  - selector:
-      matchExpressions:
-      - {key: os, operator: In, values: [darwin, linux]}
-    uri: https://github.com/ThirdScript/kube-nsrtop/releases/download/v0.1.0/kubectl-nsrtop.tar.gz
-    sha256: "REPLACE_WITH_SHA256"
-    bin: "kubectl-nsrtop"
-    files:
-    - from: "*"
-      to: "."
+    - selector:
+        matchExpressions:
+          - { key: os, operator: In, values: [darwin, linux] }
+      uri: https://github.com/ThirdScript/kube-nsrtop/releases/download/v0.1.0/kubectl-nsrtop.tar.gz
+      sha256: "bf983d581c9129504c8851f02fb90aa28e0737259d1728ecbe3810a1105736b1"
+      bin: "kubectl-nsrtop"
+      files:
+        - from: "*"
+          to: "."
   homepage: https://github.com/ThirdScript/kube-nsrtop
   shortDescription: Summarize CPU/Memory usage, requests, and limits for a namespace
   caveats: |
