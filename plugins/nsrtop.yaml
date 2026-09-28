@@ -1,0 +1,37 @@
+apiVersion: krew.googlecontainertools.github.com/v1alpha2
+kind: Plugin
+metadata:
+  name: nsrtop
+spec:
+  version: "v0.1.0"
+  platforms:
+  - selector:
+      matchExpressions:
+      - {key: os, operator: In, values: [darwin, linux]}
+    uri: https://github.com/ThirdScript/kube-nsrtop/releases/download/v0.1.0/kubectl-nsrtop.tar.gz
+    sha256: "REPLACE_WITH_SHA256"
+    bin: "kubectl-nsrtop"
+    files:
+    - from: "*"
+      to: "."
+  homepage: https://github.com/ThirdScript/kube-nsrtop
+  shortDescription: Summarize CPU/Memory usage, requests, and limits for a namespace
+  caveats: |
+    This plugin needs the following programs on your PATH:
+    * bash
+    * jq
+    * awk
+
+    For live usage data (CPU/Mem "used" values), a metrics-server must be
+    running in the target cluster. Without it, the plugin still shows
+    requests/limits and pod status.
+  description: |
+    kubectl nsrtop summarizes CPU and Memory resources for a Kubernetes
+    namespace: pod counts by phase, container restarts, requested/limit
+    totals from pod specs, live usage via `kubectl top`, usage as a
+    percentage of requests/limits, and cluster capacity context.
+
+    Usage:
+      kubectl nsrtop              # current kubectl namespace
+      kubectl nsrtop -n <ns>      # specific namespace
+      kubectl nsrtop -A           # all namespaces (aggregate)

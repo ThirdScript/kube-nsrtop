@@ -1,0 +1,266 @@
+#!/usr/bin/env bash
+#
+# kubectl-nsrtop
+#
+# Summarize CPU / Memory usage, requests, limits and pod status for a
+# Kubernetes namespace (current context namespace by default).
+#
+# Usage:
+#   kubectl nsrtop              # uses current kubectl namespace
+#   kubectl nsrtop -n <ns>      # uses the given namespace
+#   kubectl nsrtop -A           # summarize every namespace
+#   kubectl nsrtop -h           # help
+#
+# Requires: kubectl, jq
+# Optional: metrics-server (for live CPU/Mem usage via `kubectl top`)
+
+set -euo pipefail
+
+# ---------- helpers ----------------------------------------------------
+
+bold() { printf '\033[1m%s\033[0m' "$1"; }
+dim()  { printf '\033[2m%s\033[0m' "$1"; }
+red()  { printf '\033[31m%s\033[0m' "$1"; }
+green(){ printf '\033[32m%s\033[0m' "$1"; }
+yellow(){ printf '\033[33m%s\033[0m' "$1"; }
+
+usage() {
+  cat <<EOF
+Usage: kubectl nsrtop [-n NAMESPACE] [-A] [-h]
+
+  -n NAMESPACE   Namespace to summarize (default: current kubectl namespace)
+  -A             Summarize all namespaces (aggregate totals)
+  -h             Show this help
+
+Shows: pod counts by phase, container/restart info, CPU & Memory live
+usage (via 'kubectl top'), and requested/limit totals with % of the
+node-allocatable capacity used cluster-wide.
+EOF
+}
+
+# Convert CPU quantity (e.g. "250m", "1", "2000m") to millicores (int)
+cpu_to_millicores() {
+  local v="$1"
+  [[ -z "$v" || "$v" == "null" ]] && { echo 0; return; }
+  if [[ "$v" == *m ]]; then
+    echo "${v%m}"
+  else
+    # could be fractional cores like "0.5"
+    awk -v c="$v" 'BEGIN{printf "%d\n", c*1000}'
+  fi
+}
+
+# Convert memory quantity (e.g. "128Mi", "1Gi", "512000Ki", "2G") to MiB (int)
+mem_to_mib() {
+  local v="$1"
+  [[ -z "$v" || "$v" == "null" ]] && { echo 0; return; }
+  local num unit
+  num=$(sed -E 's/^([0-9.]+).*$/\1/' <<<"$v")
+  unit=$(sed -E 's/^[0-9.]+//' <<<"$v")
+  case "$unit" in
+    Ki) awk -v n="$num" 'BEGIN{printf "%d\n", n/1024}';;
+    Mi) awk -v n="$num" 'BEGIN{printf "%d\n", n}';;
+    Gi) awk -v n="$num" 'BEGIN{printf "%d\n", n*1024}';;
+    Ti) awk -v n="$num" 'BEGIN{printf "%d\n", n*1024*1024}';;
+    K|k) awk -v n="$num" 'BEGIN{printf "%d\n", n*1000/1024/1024}';;
+    M)  awk -v n="$num" 'BEGIN{printf "%d\n", n*1000000/1024/1024}';;
+    G)  awk -v n="$num" 'BEGIN{printf "%d\n", n*1000000000/1024/1024}';;
+    T)  awk -v n="$num" 'BEGIN{printf "%d\n", n*1000000000000/1024/1024}';;
+    "") awk -v n="$num" 'BEGIN{printf "%d\n", n/1024/1024}';; # raw bytes
+    *)  echo 0;;
+  esac
+}
+
+fmt_mib() {
+  local mib="$1"
+  if [[ "$mib" -ge 1024 ]]; then
+    awk -v m="$mib" 'BEGIN{printf "%.1fGi", m/1024}'
+  else
+    echo "${mib}Mi"
+  fi
+}
+
+fmt_cores() {
+  local m="$1"
+  if [[ "$m" -ge 1000 ]]; then
+    awk -v v="$m" 'BEGIN{printf "%.2f", v/1000}'
+  else
+    echo "${m}m"
+  fi
+}
+
+pct() {
+  local part="$1" whole="$2"
+  if [[ "$whole" -eq 0 ]]; then echo "n/a"; return; fi
+  awk -v p="$part" -v w="$whole" 'BEGIN{printf "%.0f%%", (p/w)*100}'
+}
+
+# ---------- arg parsing --------------------------------------------------
+
+NAMESPACE=""
+ALL_NS=false
+
+while getopts ":n:Ah" opt; do
+  case "$opt" in
+    n) NAMESPACE="$OPTARG" ;;
+    A) ALL_NS=true ;;
+    h) usage; exit 0 ;;
+    \?) echo "Unknown option: -$OPTARG" >&2; usage; exit 1 ;;
+    :) echo "Option -$OPTARG requires an argument." >&2; usage; exit 1 ;;
+  esac
+done
+
+command -v kubectl >/dev/null 2>&1 || { echo "kubectl not found in PATH" >&2; exit 1; }
+command -v jq >/dev/null 2>&1 || { echo "jq not found in PATH" >&2; exit 1; }
+
+if [[ "$ALL_NS" == true ]]; then
+  NS_FLAG=(-A)
+  NS_LABEL="ALL NAMESPACES"
+else
+  if [[ -z "$NAMESPACE" ]]; then
+    NAMESPACE=$(kubectl config view --minify -o jsonpath='{..namespace}' 2>/dev/null)
+    NAMESPACE="${NAMESPACE:-default}"
+  fi
+  NS_FLAG=(-n "$NAMESPACE")
+  NS_LABEL="$NAMESPACE"
+fi
+
+CTX=$(kubectl config current-context 2>/dev/null || echo "unknown")
+
+echo "$(bold "Kubernetes Namespace Summary")"
+echo "$(dim "Context:") $CTX"
+echo "$(dim "Namespace:") $NS_LABEL"
+echo "$(dim "Timestamp:") $(date)"
+echo
+
+# ---------- pods JSON ------------------------------------------------
+
+PODS_JSON=$(kubectl get pods "${NS_FLAG[@]}" -o json 2>/dev/null)
+if [[ -z "$PODS_JSON" ]]; then
+  echo "$(red "Failed to fetch pods.")"
+  exit 1
+fi
+
+TOTAL_PODS=$(jq '.items | length' <<<"$PODS_JSON")
+
+if [[ "$TOTAL_PODS" -eq 0 ]]; then
+  echo "No pods found in namespace '$NS_LABEL'."
+  exit 0
+fi
+
+# ---------- pod phase / restart summary -------------------------------
+
+echo "$(bold "── Pods ──────────────────────────────")"
+
+RUNNING=$(jq '[.items[] | select(.status.phase=="Running")] | length' <<<"$PODS_JSON")
+PENDING=$(jq '[.items[] | select(.status.phase=="Pending")] | length' <<<"$PODS_JSON")
+FAILED=$(jq '[.items[] | select(.status.phase=="Failed")] | length' <<<"$PODS_JSON")
+SUCCEEDED=$(jq '[.items[] | select(.status.phase=="Succeeded")] | length' <<<"$PODS_JSON")
+NOT_READY=$(jq '[.items[] | select(.status.containerStatuses != null) | select([.status.containerStatuses[].ready] | all(.==true) | not)] | length' <<<"$PODS_JSON")
+TOTAL_RESTARTS=$(jq '[.items[].status.containerStatuses[]?.restartCount] | add // 0' <<<"$PODS_JSON")
+
+printf "  Total: %s   Running: %s   Pending: %s   Failed: %s   Succeeded: %s\n" \
+  "$(bold "$TOTAL_PODS")" "$(green "$RUNNING")" "$(yellow "$PENDING")" "$(red "$FAILED")" "$SUCCEEDED"
+printf "  Not Ready: %s   Total Container Restarts: %s\n" "$NOT_READY" "$TOTAL_RESTARTS"
+echo
+
+# ---------- requests / limits totals (from pod specs) -----------------
+
+REQ_CPU_M=$(jq '[.items[].spec.containers[].resources.requests.cpu? // empty] | @csv' -r <<<"$PODS_JSON" | tr ',' '\n' | tr -d '"' | while read -r v; do [[ -n "$v" ]] && cpu_to_millicores "$v"; done | awk '{s+=$1} END{print s+0}')
+LIM_CPU_M=$(jq '[.items[].spec.containers[].resources.limits.cpu? // empty] | @csv' -r <<<"$PODS_JSON" | tr ',' '\n' | tr -d '"' | while read -r v; do [[ -n "$v" ]] && cpu_to_millicores "$v"; done | awk '{s+=$1} END{print s+0}')
+REQ_MEM_MI=$(jq '[.items[].spec.containers[].resources.requests.memory? // empty] | @csv' -r <<<"$PODS_JSON" | tr ',' '\n' | tr -d '"' | while read -r v; do [[ -n "$v" ]] && mem_to_mib "$v"; done | awk '{s+=$1} END{print s+0}')
+LIM_MEM_MI=$(jq '[.items[].spec.containers[].resources.limits.memory? // empty] | @csv' -r <<<"$PODS_JSON" | tr ',' '\n' | tr -d '"' | while read -r v; do [[ -n "$v" ]] && mem_to_mib "$v"; done | awk '{s+=$1} END{print s+0}')
+
+CONTAINERS_TOTAL=$(jq '[.items[].spec.containers[]] | length' <<<"$PODS_JSON")
+CONTAINERS_WITH_CPU_REQ=$(jq '[.items[].spec.containers[] | select(.resources.requests.cpu != null)] | length' <<<"$PODS_JSON")
+CONTAINERS_WITH_MEM_REQ=$(jq '[.items[].spec.containers[] | select(.resources.requests.memory != null)] | length' <<<"$PODS_JSON")
+
+echo "$(bold "── Requested / Limits (from pod specs) ──")"
+printf "  CPU     requests: %-10s limits: %-10s\n" "$(fmt_cores "$REQ_CPU_M")" "$(fmt_cores "$LIM_CPU_M")"
+printf "  Memory  requests: %-10s limits: %-10s\n" "$(fmt_mib "$REQ_MEM_MI")" "$(fmt_mib "$LIM_MEM_MI")"
+if [[ "$CONTAINERS_WITH_CPU_REQ" -lt "$CONTAINERS_TOTAL" || "$CONTAINERS_WITH_MEM_REQ" -lt "$CONTAINERS_TOTAL" ]]; then
+  printf "  %s %s/%s containers have CPU requests, %s/%s have Memory requests set\n" \
+    "$(yellow "note:")" "$CONTAINERS_WITH_CPU_REQ" "$CONTAINERS_TOTAL" "$CONTAINERS_WITH_MEM_REQ" "$CONTAINERS_TOTAL"
+fi
+echo
+
+# ---------- live usage via kubectl top ---------------------------------
+
+echo "$(bold "── Live Usage (kubectl top) ──────────")"
+
+TOP_OUTPUT=$(kubectl top pods "${NS_FLAG[@]}" --no-headers 2>/dev/null || true)
+
+if [[ -z "$TOP_OUTPUT" ]]; then
+  echo "  $(yellow "metrics-server unavailable or no data (kubectl top failed).")"
+else
+  if [[ "$ALL_NS" == true ]]; then
+    # columns: NAMESPACE NAME CPU MEM
+    USE_CPU_M=$(awk '{gsub("m","",$3); s+=$3} END{print s+0}' <<<"$TOP_OUTPUT")
+    USE_MEM_RAW=$(awk '{print $4}' <<<"$TOP_OUTPUT")
+  else
+    # columns: NAME CPU MEM
+    USE_CPU_M=$(awk '{gsub("m","",$2); s+=$2} END{print s+0}' <<<"$TOP_OUTPUT")
+    USE_MEM_RAW=$(awk '{print $3}' <<<"$TOP_OUTPUT")
+  fi
+  USE_MEM_MI=0
+  for m in $USE_MEM_RAW; do
+    v=$(mem_to_mib "$m")
+    USE_MEM_MI=$((USE_MEM_MI + v))
+  done
+
+  printf "  CPU     used: %-10s\n" "$(fmt_cores "$USE_CPU_M")"
+  printf "  Memory  used: %-10s\n" "$(fmt_mib "$USE_MEM_MI")"
+  echo
+
+  if [[ "$REQ_CPU_M" -gt 0 ]]; then
+    printf "  CPU usage vs requests: %s\n" "$(pct "$USE_CPU_M" "$REQ_CPU_M")"
+  fi
+  if [[ "$LIM_CPU_M" -gt 0 ]]; then
+    printf "  CPU usage vs limits:   %s\n" "$(pct "$USE_CPU_M" "$LIM_CPU_M")"
+  fi
+  if [[ "$REQ_MEM_MI" -gt 0 ]]; then
+    printf "  Mem usage vs requests: %s\n" "$(pct "$USE_MEM_MI" "$REQ_MEM_MI")"
+  fi
+  if [[ "$LIM_MEM_MI" -gt 0 ]]; then
+    printf "  Mem usage vs limits:   %s\n" "$(pct "$USE_MEM_MI" "$LIM_MEM_MI")"
+  fi
+fi
+echo
+
+# ---------- cluster capacity context ------------------------------------
+
+echo "$(bold "── Cluster Capacity Context ──────────")"
+NODES_TOP=$(kubectl top nodes --no-headers 2>/dev/null || true)
+if [[ -n "$NODES_TOP" ]]; then
+  NODE_COUNT=$(wc -l <<<"$NODES_TOP" | tr -d ' ')
+  CLUSTER_CPU_ALLOC_M=$(kubectl get nodes -o json 2>/dev/null | jq '[.items[].status.allocatable.cpu] | map(if test("m$") then (rtrimstr("m")|tonumber) else (tonumber*1000) end) | add // 0')
+  CLUSTER_MEM_ALLOC_KI=$(kubectl get nodes -o json 2>/dev/null | jq -r '[.items[].status.allocatable.memory] | map(rtrimstr("Ki")|tonumber) | add // 0')
+  CLUSTER_MEM_ALLOC_MI=$((CLUSTER_MEM_ALLOC_KI / 1024))
+
+  printf "  Nodes: %s   Cluster allocatable CPU: %s   Cluster allocatable Mem: %s\n" \
+    "$NODE_COUNT" "$(fmt_cores "$CLUSTER_CPU_ALLOC_M")" "$(fmt_mib "$CLUSTER_MEM_ALLOC_MI")"
+
+  if [[ -n "${USE_CPU_M:-}" && "$CLUSTER_CPU_ALLOC_M" -gt 0 ]]; then
+    printf "  This namespace's live CPU usage is %s of total cluster allocatable CPU\n" "$(pct "$USE_CPU_M" "$CLUSTER_CPU_ALLOC_M")"
+  fi
+  if [[ -n "${USE_MEM_MI:-}" && "$CLUSTER_MEM_ALLOC_MI" -gt 0 ]]; then
+    printf "  This namespace's live Mem usage is %s of total cluster allocatable Mem\n" "$(pct "$USE_MEM_MI" "$CLUSTER_MEM_ALLOC_MI")"
+  fi
+else
+  echo "  $(yellow "kubectl top nodes unavailable.")"
+fi
+echo
+
+# ---------- top pods by usage (only for single namespace) --------------
+
+if [[ "$ALL_NS" == false && -n "$TOP_OUTPUT" ]]; then
+  echo "$(bold "── Top Pods by CPU ───────────────────")"
+  sort -k2 -h -r <<<"$TOP_OUTPUT" | head -5 | awk '{printf "  %-55s CPU: %-8s MEM: %s\n", $1, $2, $3}'
+  echo
+  echo "$(bold "── Top Pods by Memory ────────────────")"
+  # sort by memory column, converting Mi/Gi roughly (Gi > Mi so sort -h works if unit suffix kept consistent-ish)
+  awk '{v=$3; unit=substr(v,length(v)-1,2); num=substr(v,1,length(v)-2); if(unit=="Gi") num=num*1024; print num" "$0}' <<<"$TOP_OUTPUT" | sort -k1 -n -r | cut -d' ' -f2- | head -5 | awk '{printf "  %-55s CPU: %-8s MEM: %s\n", $1, $2, $3}'
+  echo
+fi
+
+echo "$(dim "Done.")"
